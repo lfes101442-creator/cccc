@@ -1,200 +1,298 @@
-"""vulnerable_app.py.
-
-此程式碼已進行安全重構，修復了 SQL 注入、阻斷服務、憑證洩漏等漏洞，
-並改善了程式碼壞味道（Code Smell）。
-"""
-
-import hmac
+import ipaddress
 import logging
 import os
 import secrets
 import sqlite3
 import subprocess
+from pathlib import Path
 from typing import Any, List, Optional
+from urllib.parse import urlparse
+
 import requests
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 
-# 建立 Logger 代替 print 進行除錯，避免機敏資訊外洩
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
-# ==============================================================================
-# 安全修復：將硬編碼憑證移至環境變數（Hardcoded Secrets -> Environment Variables）
-# ==============================================================================
-PASSWORD = os.getenv("APP_ADMIN_PASSWORD", "default_secure_fallback_password")
-API_KEY = os.getenv("APP_API_KEY")
+# =============================================================================
+# Security Constants
+# =============================================================================
 
-users: List[str] = []
+DATABASE_PATH = "test.db"
 
+SAFE_FILE_BASE = Path("./data").resolve()
 
-# ==============================================================================
-# 安全修復：SQL 注入（SQL Injection -> Parameterized Query）
-# ==============================================================================
-def login(username: str, password: str) -> bool:
-    """使用參數化查詢防止 SQL Injection。"""
-    conn = sqlite3.connect("test.db")
-    cursor = conn.cursor()
+ALLOWED_COMMANDS = {
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
 
-    # 使用 ? 作為佔位符，由 DB 驅動安全處理輸入值
-    query = "SELECT * FROM users WHERE username=? AND password=?"
-    cursor.execute(query, (username, password))
-    result = cursor.fetchone()
-    conn.close()
+ALLOWED_API_HOSTS = {
+    "api.secure-domain.com",
+}
 
-    return result is not None
+REQUEST_TIMEOUT = 5
 
+# =============================================================================
+# Password Hashing
+# =============================================================================
 
-# ==============================================================================
-# 安全修復：命令注入（Command Injection -> Shlex Split & shell=False）
-# ==============================================================================
-def ping_host(ip: str) -> None:
-    """移除 os.system，改用 subprocess 並關閉 shell=True。"""
-    try:
-        # 使用 list 傳入參數，且不透過 shell 執行，防止指令拼接注入
-        subprocess.run(["ping", "-c", "1", ip], shell=False, check=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Ping failed: {e}")
+password_hasher = PasswordHasher()
 
 
-def run_command(cmd: List[str]) -> None:
-    """禁止接收字串型態並開啟 shell=True 的指令執行。"""
-    if not isinstance(cmd, list):
-        raise ValueError("Command must be a list of arguments")
-    subprocess.run(cmd, shell=False, check=True)
-
-
-# ==============================================================================
-# 安全修復：弱雜湊演算法（Weak Hash -> SHA-256 / PBKDF2）
-# ==============================================================================
 def hash_password(password: str) -> str:
-    """廢棄 MD5，改用更安全的 SHA-256（實務上建議用 bcrypt 或 argon2）。"""
-    # 這裡示範使用密碼學安全的 hmac / hashlib.sha256
-    import hashlib
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Hash password using Argon2."""
+    return password_hasher.hash(password)
 
 
-# ==============================================================================
-# 安全修復：可預測隨機數（Predictable Random -> Secrets Module）
-# ==============================================================================
-def generate_token() -> int:
-    """廢棄 random.seed()，改用密碼學安全的 secrets 模組。"""
-    return secrets.randbelow(9000) + 1000  # 生成 1000 ~ 9999 的隨機數
-
-
-# ==============================================================================
-# 安全修復：不安全的反序列化（Dangerous Pickle -> JSON / Safe Format）
-# ==============================================================================
-def load_user_data_safe(data_string: str) -> Any:
-    """廢棄 pickle.load() 以防 RCE 漏洞，改用標準 JSON。"""
-    import json
-    return json.loads(data_string)
-
-
-# ==============================================================================
-# 壞味道修復：錯誤處理與邏輯優化（Code Smells & Logic Errors）
-# ==============================================================================
-def divide(a: float, b: float) -> Optional[float]:
-    """加入除以零檢查，避免程式崩潰。"""
-    if b == 0:
-        logger.warning("Attempted to divide by zero.")
-        return None
-    return a / b
-
-
-def calculate() -> int:
-    """移除未使用的變數 z。"""
-    x = 100
-    y = 200
-    return x + y
-
-
-def add_numbers(a: int, b: int) -> int:
-    """刪除重複的 add_numbers2 函數，統一呼叫此函數。"""
-    result = a + b
-    logger.info(f"Result: {result}")
-    return result
-
-
-def recursive(depth: int = 0) -> None:
-    """加入終止條件，防止無限遞迴（Stack Overflow）。"""
-    if depth > 10:
-        return
-    recursive(depth + 1)
-
-
-def safe_exception() -> None:
-    """禁止使用空捕捉（Bare Except），必須指定異常型態並記錄 log。"""
+def verify_password(password: str, hashed_password: str) -> bool:
+    """Verify password securely."""
     try:
-        _ = 1 / 0
-    except ZeroDivisionError as e:
-        logger.error(f"Captured expected error: {e}")
+        return password_hasher.verify(hashed_password, password)
+    except VerifyMismatchError:
+        return False
 
 
-def debug_mode() -> None:
-    """移除敏感密碼列印，改用適當的 Log 層級。"""
-    logger.debug("DEBUG MODE ENABLED")
+# =============================================================================
+# Database
+# =============================================================================
 
+def get_user_password_hash(username: str) -> Optional[str]:
+    """Fetch password hash from database."""
 
-def call_api() -> str:
-    """將硬編碼 URL 參數化（應從設定檔或環境變數讀取），實務上應盡量避免不安全的 http。"""
-    url = os.getenv("API_ENDPOINT", "https://api.secure-domain.com/data")
-    response = requests.get(url, timeout=10)  # 加入 timeout 防止連線掛起阻斷服務
-    return response.text
-
-
-def read_file(file_path: str = "test.txt") -> str:
-    """使用 with context manager 確保檔案資源正確釋放（修復 Leak）。"""
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def calculate_input_safe(user_input: str) -> Any:
-    """絕對禁止使用 eval()，改用安全解析數學公式的 ast.literal_eval。"""
-    import ast
-    try:
-        return ast.literal_eval(user_input)
-    except (ValueError, SyntaxError):
-        logger.error("Invalid or unsafe input for evaluation.")
+    if not isinstance(username, str):
         return None
 
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
 
-# ==============================================================================
-# 壞味道修復：全局變數、長函數、可變預設參數、None 比較
-# ==============================================================================
-# 移除全域變數 count 濫用，改用類別或封裝（此處簡化示範）
+        cursor.execute(
+            "SELECT password_hash FROM users WHERE username = ?",
+            (username,)
+        )
 
-def huge_function() -> None:
-    """將原本冗長且重複的列印邏輯簡化。"""
-    for i in range(1, 21):
-        logger.info(f"line{i}")
+        result = cursor.fetchone()
+
+    if result is None:
+        return None
+
+    return result[0]
 
 
-def test_return() -> bool:
-    """移除無法執行到的程式碼（Unreachable Code）。"""
+def login(username: str, password: str) -> bool:
+    """Secure login flow."""
+
+    if not username or not password:
+        return False
+
+    stored_hash = get_user_password_hash(username)
+
+    if stored_hash is None:
+        return False
+
+    return verify_password(password, stored_hash)
+
+
+# =============================================================================
+# Token Generation
+# =============================================================================
+
+def generate_secure_token() -> str:
+    """Generate cryptographically secure token."""
+    return secrets.token_urlsafe(32)
+
+
+# =============================================================================
+# Safe Command Execution
+# =============================================================================
+
+def run_allowed_command(command_name: str) -> str:
+    """Run only allowlisted commands."""
+
+    if command_name not in ALLOWED_COMMANDS:
+        raise ValueError("Command not allowed")
+
+    cmd = ALLOWED_COMMANDS[command_name]
+
+    result = subprocess.run(
+        cmd,
+        shell=False,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    return result.stdout
+
+
+# =============================================================================
+# IP Validation
+# =============================================================================
+
+def validate_ip(ip: str) -> bool:
+    """Validate IPv4 / IPv6 address."""
+
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+
+def ping_host(ip: str) -> bool:
+    """Safely ping validated IP."""
+
+    if not validate_ip(ip):
+        raise ValueError("Invalid IP address")
+
+    try:
+        subprocess.run(
+            ["ping", "-c", "1", ip],
+            shell=False,
+            check=True,
+            timeout=3,
+            capture_output=True,
+        )
+
+        return True
+
+    except subprocess.SubprocessError as e:
+        logger.error("Ping failed: %s", e)
+        return False
+
+
+# =============================================================================
+# Safe File Access
+# =============================================================================
+
+def safe_read_file(file_name: str) -> str:
+    """Prevent path traversal."""
+
+    target_path = (SAFE_FILE_BASE / file_name).resolve()
+
+    if not str(target_path).startswith(str(SAFE_FILE_BASE)):
+        raise ValueError("Invalid file path")
+
+    with open(target_path, "r", encoding="utf-8") as file:
+        return file.read()
+
+
+# =============================================================================
+# SSRF Protection
+# =============================================================================
+
+def validate_api_url(url: str) -> bool:
+    """Allow only trusted domains."""
+
+    parsed = urlparse(url)
+
+    if parsed.scheme != "https":
+        return False
+
+    if parsed.hostname not in ALLOWED_API_HOSTS:
+        return False
+
     return True
 
 
-def check_none(value: Any) -> bool:
-    """使用 'is None' 代替 '== None'。"""
-    return value is None
+def call_api() -> str:
+    """Safely call external API."""
+
+    url = os.getenv(
+        "API_ENDPOINT",
+        "https://api.secure-domain.com/data"
+    )
+
+    if not validate_api_url(url):
+        raise ValueError("Untrusted API endpoint")
+
+    try:
+        response = requests.get(
+            url,
+            timeout=REQUEST_TIMEOUT
+        )
+
+        response.raise_for_status()
+
+        return response.text
+
+    except requests.RequestException as e:
+        logger.error("API request failed: %s", e)
+        return ""
 
 
-def append_item(item: Any, items: Optional[List[Any]] = None) -> List[Any]:
-    """修復可變動預設參數（Mutable Default Argument）共用記憶體的問題。"""
+# =============================================================================
+# Safe JSON Parsing
+# =============================================================================
+
+def load_json_safe(data: str) -> Any:
+    """Safely parse JSON with size limit."""
+
+    import json
+
+    MAX_SIZE = 10000
+
+    if len(data) > MAX_SIZE:
+        raise ValueError("JSON payload too large")
+
+    return json.loads(data)
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def divide(a: float, b: float) -> Optional[float]:
+    """Safe division."""
+
+    if b == 0:
+        logger.warning("Division by zero attempted")
+        return None
+
+    return a / b
+
+
+def append_item(
+    item: Any,
+    items: Optional[List[Any]] = None
+) -> List[Any]:
+    """Avoid mutable default arguments."""
+
     if items is None:
         items = []
+
     items.append(item)
+
     return items
 
 
-# ==============================================================================
+# =============================================================================
 # Main
-# ==============================================================================
+# =============================================================================
+
 if __name__ == "__main__":
-    # 測試執行
-    logger.info(f"Login success: {login('admin', 'admin')}")
-    ping_host("127.0.0.1")
-    logger.info(f"Token: {generate_token()}")
-    safe_exception()
-    debug_mode()
-    logger.info(f"Calc: {calculate_input_safe('2')}")  # literal_eval 安全解析
-    huge_function()
+
+    logger.info("Application started")
+
+    token = generate_secure_token()
+
+    logger.info("Generated token successfully")
+
+    print(token)
+
+    try:
+        output = run_allowed_command("date")
+        print(output)
+
+    except Exception as e:
+        logger.error("Command execution error: %s", e)
