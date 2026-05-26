@@ -277,6 +277,30 @@ def append_item(
 
 
 # =============================================================================
+# Safe Recursive Function
+# =============================================================================
+
+def recursive(depth: int = 0, max_depth: int = 10) -> None:
+    """
+    Recursive function with a safe exit condition.
+
+    Args:
+        depth (int): Current recursion depth.
+        max_depth (int): Maximum allowed recursion depth.
+    """
+
+    logger.info("Current recursion depth: %s", depth)
+
+    # Base case to stop recursion
+    if depth >= max_depth:
+        logger.info("Maximum recursion depth reached")
+        return
+
+    # Recursive call
+    recursive(depth + 1, max_depth)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -296,3 +320,6 @@ if __name__ == "__main__":
 
     except Exception as e:
         logger.error("Command execution error: %s", e)
+
+    # Test recursive function
+    recursive()
